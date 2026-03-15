@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=DStacks
+Comment=Two-player physics stacking game
+Exec=bash %k/../play_dstacks.sh
+Icon=%k/../assets/images/icon.png
+Terminal=false
+Categories=Game;
+StartupNotify=true
