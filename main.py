@@ -33,7 +33,7 @@ pygame.mixer.init()
 SCREEN_WIDTH  = 800
 SCREEN_HEIGHT = 600
 FPS           = 60
-DEBUG         = True   # toggle with D key
+DEBUG         = False  # toggle with D key to show collision outlines
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("DStacks")
@@ -42,40 +42,55 @@ clock = pygame.time.Clock()
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 BAR_WIDTH          = 600
-BAR_VISUAL_HEIGHT  = 8
-BAR_PHYSICS_HEIGHT = 25
-BAR_Y              = 500   # screen-Y of the top of the visible bar
+BAR_PHYSICS_HEIGHT = 14    # one value, used for both visual and physics
+BAR_VISUAL_HEIGHT  = BAR_PHYSICS_HEIGHT   # visual = physics → no mismatch
+BAR_Y              = 500   # screen-Y of the TOP surface of the bar (where tiles land)
 
-GRAVITY            = -500
-DAMPING            = 0.2
+GRAVITY            = -600          # slightly gentler fall
+DAMPING            = 0.85          # global space damping — kills residual motion fast
 DENSITY            = 0.3
-COLLISION_MARGIN   = 0.5
-SOLVER_ITERATIONS  = 40
-VELOCITY_THRESHOLD = 0.5
-STILL_FRAMES       = 30
-SETTLE_READY_DELAY = 10
-SETTLE_DURATION    = 240
-LOSS_TOLERANCE     = 5
+COLLISION_MARGIN   = 0.0           # 0 = shapes touch exactly; >0 adds invisible padding that causes jitter
+SOLVER_ITERATIONS  = 60            # more iterations = stiffer, more accurate contacts
+
+# Stability detection — all three must hold simultaneously
+VELOCITY_THRESHOLD   = 0.4         # linear speed px/s
+ANGULAR_THRESHOLD    = 0.04        # radians/s  (catches spinning-but-not-translating tiles)
+STILL_FRAMES         = 90          # frames (1.5 s) all bodies must be below both thresholds
+SETTLE_READY_DELAY   = 6
+SETTLE_DURATION      = 400         # hard timeout frames
+
+LOSS_TOLERANCE     = 8
 
 ANGLE_STEP      = math.radians(10)
 MOVE_STEP       = 8
-TARGET_TILE_SIZE = 162     # max pixel dimension after scaling
+TARGET_TILE_SIZE = 130    # silhouette target — all characters same game size
+
+# ─── Camera / scroll ──────────────────────────────────────────────────────────
+# Camera only advances between turns (never while a tile is falling).
+# Target: keep the highest SETTLED tile at the vertical centre of the screen.
+CAMERA_LERP_RATE  = 0.03   # slow, smooth scroll between turns
+
+# ─── Level / bar-growth ───────────────────────────────────────────────────────
+LEVEL_TILES         = 10    # successful tiles before bar grows
+BAR_GROWTH_FACTOR   = 1.20  # bar gets 20 % wider per level
+MAX_BAR_WIDTH       = SCREEN_WIDTH - 20   # cap so bar can't exceed screen
 
 # ─── Colours ──────────────────────────────────────────────────────────────────
 
-P1_MAIN  = (231,  76,  60)
-P1_LIGHT = (236, 112,  99)
-P1_DARK  = (192,  57,  43)
-P1_TINT  = (231,  76,  60,  40)
+P1_MAIN  = (220,  60,  50)
+P1_LIGHT = (240, 100,  88)
+P1_DARK  = (170,  35,  25)
+P1_TINT  = (220,  60,  50,  25)
 
-P2_MAIN  = ( 52, 152, 219)
-P2_LIGHT = ( 93, 173, 226)
-P2_DARK  = ( 41, 128, 185)
-P2_TINT  = ( 52, 152, 219,  40)
+P2_MAIN  = ( 40, 130, 210)
+P2_LIGHT = ( 80, 165, 235)
+P2_DARK  = ( 25,  95, 165)
+P2_TINT  = ( 40, 130, 210,  25)
 
-NEUTRAL_BG_TOP    = (220, 220, 240)
-NEUTRAL_BG_BOTTOM = (180, 180, 200)
-BAR_COLOR         = (139,  69,  19)
+NEUTRAL_BG_TOP    = (235, 238, 250)
+NEUTRAL_BG_BOTTOM = (195, 200, 222)
+BAR_COLOR         = ( 90,  55,  20)   # darker walnut brown
+BAR_SHADOW        = ( 55,  32,  10)
 
 # ─── Sound ────────────────────────────────────────────────────────────────────
 
@@ -159,15 +174,22 @@ def _load_tiles() -> list:
             img_orig = _remove_black_bg(img_orig)
 
         orig_w, orig_h = img_orig.get_size()
-        scale = min(TARGET_TILE_SIZE / orig_w, TARGET_TILE_SIZE / orig_h, 1.0)
 
-        if scale < 1.0:
-            new_w = int(orig_w * scale)
-            new_h = int(orig_h * scale)
-            img = pygame.transform.smoothscale(img_orig, (new_w, new_h))
+        # Scale by SILHOUETTE extent (from outer_contour) so every character
+        # occupies the same in-game footprint regardless of image padding.
+        if "outer_contour" in item and item["outer_contour"]:
+            oc = item["outer_contour"]
+            sil_w = max(v[0] for v in oc) - min(v[0] for v in oc)
+            sil_h = max(v[1] for v in oc) - min(v[1] for v in oc)
+            sil_extent = max(sil_w, sil_h)
         else:
-            img   = img_orig
-            scale = 1.0
+            sil_extent = max(orig_w, orig_h)
+
+        scale = min(TARGET_TILE_SIZE / sil_extent, 1.0) if sil_extent > 0 else 1.0
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        img   = pygame.transform.smoothscale(img_orig, (new_w, new_h)) if scale < 1.0 else img_orig
+        if scale >= 1.0:
             new_w, new_h = orig_w, orig_h
 
         pivot_key = "center_of_mass" if "center_of_mass" in item else "pivot"
@@ -219,28 +241,32 @@ def random_convex_polygon(avg_radius=45, num_verts=8):
 
 space = pymunk.Space()
 space.gravity            = (0, GRAVITY)
-space.damping            = 1.0          # per-body damping set explicitly
-space.collision_slop     = 0.2
+space.damping            = DAMPING     # applied every step — drains energy continuously
+space.collision_slop     = 0.1        # tighter overlap tolerance
 space.iterations         = SOLVER_ITERATIONS
 
 bar_body = pymunk.Body(body_type=pymunk.Body.STATIC)
-bar_body.position = (
-    SCREEN_WIDTH // 2,
-    (SCREEN_HEIGHT - BAR_Y) - BAR_PHYSICS_HEIGHT / 2,
-)
+# BAR_Y is screen-Y of the bar's TOP surface (camera_y=0 at game start).
+# world_y of top surface  = SCREEN_HEIGHT - BAR_Y
+# body centre sits half a bar-height below that:
+bar_world_y = (SCREEN_HEIGHT - BAR_Y) - BAR_PHYSICS_HEIGHT / 2
+bar_body.position = (SCREEN_WIDTH // 2, bar_world_y)
 bar_shape = pymunk.Poly.create_box(bar_body, (BAR_WIDTH, BAR_PHYSICS_HEIGHT))
-bar_shape.friction         = 1.0
-bar_shape.elasticity       = 0.05
-bar_shape.collision_margin = COLLISION_MARGIN
+bar_shape.friction         = 1.5
+bar_shape.elasticity       = 0.0    # completely dead stop on bar
+bar_shape.collision_margin = 0.0
 space.add(bar_body, bar_shape)
+
+# ─── Camera state (global so to_pygame can use it) ───────────────────────────
+camera_y = 0.0   # world units the camera has scrolled upward
 
 # ─── Coordinate helpers ───────────────────────────────────────────────────────
 
 def to_pygame(p):
-    """Convert Pymunk world coords → Pygame screen coords (Y flip)."""
-    if hasattr(p, "x"):
-        return int(p.x), int(SCREEN_HEIGHT - p.y)
-    return int(p[0]), int(SCREEN_HEIGHT - p[1])
+    """Convert Pymunk world coords → Pygame screen coords (Y flip + camera)."""
+    px = p.x if hasattr(p, "x") else p[0]
+    py = p.y if hasattr(p, "y") else p[1]
+    return int(px), int(SCREEN_HEIGHT - py + camera_y)
 
 # ─── Drawing helpers ──────────────────────────────────────────────────────────
 
@@ -264,12 +290,24 @@ def draw_rounded_rect(surf, color, rect, radius, border=0, border_color=None):
 
 
 def draw_background(player: int):
+    # Base gradient
     draw_gradient_rect(screen, NEUTRAL_BG_TOP, NEUTRAL_BG_BOTTOM,
                        pygame.Rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT))
-    tint = P1_TINT if player == 1 else P2_TINT
-    overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-    overlay.fill(tint)
-    screen.blit(overlay, (0, 0))
+
+    # Subtle dot-grid for depth (every 32px)
+    dot_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    for gx in range(0, SCREEN_WIDTH, 32):
+        for gy in range(0, SCREEN_HEIGHT, 32):
+            pygame.draw.circle(dot_surf, (160, 165, 190, 40), (gx, gy), 1)
+    screen.blit(dot_surf, (0, 0))
+
+    # Player colour tint — stronger at bottom (where action is)
+    tint_col = P1_MAIN if player == 1 else P2_MAIN
+    tint_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+    for y in range(SCREEN_HEIGHT):
+        alpha = int(18 * (y / SCREEN_HEIGHT))   # 0 at top, 18 at bottom
+        pygame.draw.line(tint_surf, (*tint_col, alpha), (0, y), (SCREEN_WIDTH, y))
+    screen.blit(tint_surf, (0, 0))
 
 
 # ─── FIX #3: correct COM-offset formula ──────────────────────────────────────
@@ -433,27 +471,60 @@ def draw_preview(surface, pdata, x, y, angle, player):
 # ─── Game-logic helpers ───────────────────────────────────────────────────────
 
 def all_bodies_still():
-    return all(
-        b.velocity.length <= VELOCITY_THRESHOLD
-        for b in space.bodies
-        if b.body_type == pymunk.Body.DYNAMIC
-    )
+    """True only when every dynamic body is below BOTH linear and angular thresholds.
+    Checking angular_velocity catches tiles that are spinning in place (low linear
+    speed but still rocking/vibrating on the pile)."""
+    for b in space.bodies:
+        if b.body_type != pymunk.Body.DYNAMIC:
+            continue
+        if b.velocity.length > VELOCITY_THRESHOLD:
+            return False
+        if abs(b.angular_velocity) > ANGULAR_THRESHOLD:
+            return False
+    return True
 
 
 def check_loss(player):
+    """A tile is 'lost' only when its centre of mass is below the bar's
+    bottom surface — i.e. it has fully cleared the bar and is falling away.
+    Tiles resting ON the bar will never trigger this."""
+    bar_bottom_world = bar_body.position.y - BAR_PHYSICS_HEIGHT / 2
     for body in space.bodies:
         if body.body_type != pymunk.Body.DYNAMIC:
             continue
         if getattr(body, "player", -1) != player:
             continue
-        for shape in body.shapes:
-            if not isinstance(shape, pymunk.Poly):
-                continue
-            screen_verts = [to_pygame(body.local_to_world(v))
-                            for v in shape.get_vertices()]
-            if screen_verts and max(v[1] for v in screen_verts) > BAR_Y + LOSS_TOLERANCE:
-                return True
+        # body.position.y is the COM in world Y (Y-up).
+        # Below bar bottom + a small margin = truly fallen off.
+        if body.position.y < bar_bottom_world - LOSS_TOLERANCE:
+            return True
     return False
+
+
+def fallen_tile_off_screen(player):
+    """Return True once every fallen tile belonging to player is fully
+    below the visible screen (so game-over is declared only after the
+    tile disappears from view, not the instant it leaves the bar)."""
+    bar_bottom_world = bar_body.position.y - BAR_PHYSICS_HEIGHT / 2
+    for body in space.bodies:
+        if body.body_type != pymunk.Body.DYNAMIC:
+            continue
+        if getattr(body, "player", -1) != player:
+            continue
+        if body.position.y >= bar_bottom_world - LOSS_TOLERANCE:
+            continue   # this tile is still on the bar — ignore it
+        # Find the highest vertex of this body in screen coords
+        max_world_y = body.position.y   # fallback
+        for shape in body.shapes:
+            if isinstance(shape, pymunk.Poly):
+                for v in shape.get_vertices():
+                    wv = body.local_to_world(v)
+                    if wv.y > max_world_y:
+                        max_world_y = wv.y
+        screen_top = SCREEN_HEIGHT - max_world_y + camera_y
+        if screen_top <= SCREEN_HEIGHT:
+            return False   # at least one fallen tile still visible
+    return True   # all fallen tiles are off screen
 
 
 def _make_preview_data():
@@ -472,7 +543,10 @@ def _make_preview_data():
 
 def drop_tile(pdata, x, y_screen, angle):
     """Create a physics body + shapes for the given preview_data. Returns body."""
-    pos = (x, SCREEN_HEIGHT - y_screen)
+    # y_screen is screen-pixels from top; convert to world Y accounting for camera
+    world_y = SCREEN_HEIGHT - y_screen + camera_y
+
+    pos = (x, world_y)
 
     if "convex_parts" in pdata:
         parts = pdata["convex_parts"]
@@ -488,8 +562,6 @@ def drop_tile(pdata, x, y_screen, angle):
         body   = pymunk.Body(mass, moment)
         body.position         = pos
         body.angle            = angle
-        body.linear_damping   = DAMPING
-        body.angular_damping  = DAMPING
         body.player           = current_player          # noqa: F821 – set before call
 
         # FIX #2: store in registry, not as body attribute
@@ -497,10 +569,10 @@ def drop_tile(pdata, x, y_screen, angle):
 
         shapes = []
         for part in parts:
-            sh = pymunk.Poly(body, [(x, -y) for x, y in part])  # Y-flip: image Y-down → Pymunk Y-up
-            sh.friction         = 1.0
-            sh.elasticity       = 0.05
-            sh.collision_margin = COLLISION_MARGIN
+            sh = pymunk.Poly(body, [(x, -y) for x, y in part])
+            sh.friction         = 1.2
+            sh.elasticity       = 0.0   # no bounce whatsoever
+            sh.collision_margin = 0.0   # exact shape — margin causes jitter
             shapes.append(sh)
         space.add(body, *shapes)
 
@@ -511,13 +583,11 @@ def drop_tile(pdata, x, y_screen, angle):
         body   = pymunk.Body(mass, moment)
         body.position        = pos
         body.angle           = angle
-        body.linear_damping  = DAMPING
-        body.angular_damping = DAMPING
         body.player          = current_player           # noqa: F821
         sh = pymunk.Poly(body, verts)
-        sh.friction  = 1.0
-        sh.elasticity = 0.05
-        sh.collision_margin = COLLISION_MARGIN
+        sh.friction         = 1.2
+        sh.elasticity       = 0.0
+        sh.collision_margin = 0.0
         space.add(body, sh)
 
     if sound_enabled and "drop" in sounds:
@@ -526,13 +596,34 @@ def drop_tile(pdata, x, y_screen, angle):
     return body
 
 
+def _rebuild_bar(new_width):
+    """Replace the static bar shape with one of new_width. Bar centre stays fixed."""
+    global bar_shape, current_bar_width
+    space.remove(bar_shape)
+    current_bar_width = int(new_width)
+    bar_shape = pymunk.Poly.create_box(bar_body, (current_bar_width, BAR_PHYSICS_HEIGHT))
+    bar_shape.friction         = 1.0
+    bar_shape.elasticity       = 0.05
+    bar_shape.collision_margin = COLLISION_MARGIN
+    space.add(bar_shape)
+
+
 def reset_game():
     """Remove all dynamic bodies and reset state (bar stays)."""
+    global camera_y, tiles_placed, current_level, current_bar_width, level_flash_timer, watching_fall
     to_remove_bodies = [b for b in space.bodies  if b.body_type == pymunk.Body.DYNAMIC]
     to_remove_shapes = [s for s in space.shapes  if s is not bar_shape]
     space.remove(*to_remove_bodies, *to_remove_shapes)
     body_tile_registry.clear()
     _drawn_ids.clear()
+    camera_y          = 0.0
+    tiles_placed      = 0
+    current_level     = 1
+    current_bar_width = BAR_WIDTH
+    level_flash_timer = 0
+    watching_fall     = False
+    # Restore bar to original width
+    _rebuild_bar(BAR_WIDTH)
 
 
 # ─── UI widgets ───────────────────────────────────────────────────────────────
@@ -543,10 +634,10 @@ except Exception:
     btn_font = pygame.font.Font(None, 42)
 
 buttons = {
-    "rotate": pygame.Rect(250, 540, 120, 50),
-    "drop":   pygame.Rect(430, 540, 120, 50),
+    "rotate": pygame.Rect(SCREEN_WIDTH // 2 - 160, SCREEN_HEIGHT - 58, 140, 44),
+    "drop":   pygame.Rect(SCREEN_WIDTH // 2 +  20, SCREEN_HEIGHT - 58, 140, 44),
 }
-button_labels = {"rotate": "↻ ROTATE", "drop": "DROP"}
+button_labels = {"rotate": "↻  ROTATE", "drop": "▼  DROP"}
 
 # ─── Game state ───────────────────────────────────────────────────────────────
 
@@ -557,14 +648,21 @@ transition_active = False
 transition_timer  = 0
 next_player       = 1
 
+# ─── Progression state ────────────────────────────────────────────────────────
+tiles_placed      = 0          # total successful tiles this game
+current_level     = 1
+current_bar_width = BAR_WIDTH
+level_flash_timer = 0          # frames left to show "Level Up!" banner
+
 preview_active = True
 preview_data   = _make_preview_data()
 preview_x      = SCREEN_WIDTH // 2
 preview_y      = 50
 preview_angle  = 0.0
 
-dragging   = False
-settling   = False
+dragging      = False
+settling      = False
+watching_fall = False   # True while waiting for fallen tile to leave screen
 settle_frames      = 0
 still_counter      = 0
 settle_ready_ctr   = 0
@@ -596,16 +694,16 @@ while running:
 
             if event.key == pygame.K_RETURN and game_over:
                 reset_game()
-                current_player  = 1
-                game_over       = False
-                winner          = None
+                current_player    = 1
+                game_over         = False
+                winner            = None
                 transition_active = False
-                preview_active  = True
-                preview_data    = _make_preview_data()
-                preview_x       = SCREEN_WIDTH // 2
-                preview_angle   = 0.0
-                settling        = False
-                dragging        = False
+                preview_active    = True
+                preview_data      = _make_preview_data()
+                preview_x         = SCREEN_WIDTH // 2
+                preview_angle     = 0.0
+                settling          = False
+                dragging          = False
                 continue
 
             if not game_over and preview_active and not settling and not transition_active:
@@ -667,6 +765,25 @@ while running:
     for _ in range(8):
         space.step(1 / FPS / 8)
 
+    # ── Camera scroll — only between turns, tracks settled pile ──────────────
+    # Never update camera while a tile is in flight (prevents oscillation).
+    if not settling:
+        # Highest world-Y among all settled dynamic bodies
+        settled_ys = [
+            b.position.y
+            for b in space.bodies
+            if b.body_type == pymunk.Body.DYNAMIC
+        ]
+        if settled_ys:
+            pile_peak_world = max(settled_ys)
+            # We want pile_peak to appear at screen centre (SCREEN_HEIGHT // 2).
+            # screen_y = SCREEN_HEIGHT - world_y + camera_y
+            # Set screen_y = SCREEN_HEIGHT // 2:
+            #   camera_target = world_y - SCREEN_HEIGHT + SCREEN_HEIGHT // 2
+            #                 = world_y - SCREEN_HEIGHT // 2
+            camera_target = max(0.0, pile_peak_world - SCREEN_HEIGHT // 2)
+            camera_y += (camera_target - camera_y) * CAMERA_LERP_RATE
+
     # ── Settle detection ──────────────────────────────────────────────────────
     if settling:
         settle_frames += 1
@@ -686,14 +803,27 @@ while running:
         if resolved:
             settling = False
             if check_loss(current_player):
-                game_over = True
-                winner    = 3 - current_player
-                if sound_enabled and "game_over" in sounds:
-                    sounds["game_over"].play()
+                # Tile has fallen off bar — wait until it scrolls off screen
+                watching_fall = True
             else:
+                tiles_placed += 1
+                if tiles_placed % LEVEL_TILES == 0:
+                    current_level += 1
+                    new_w = min(int(current_bar_width * BAR_GROWTH_FACTOR), MAX_BAR_WIDTH)
+                    _rebuild_bar(new_w)
+                    level_flash_timer = 120
                 transition_active = True
                 transition_timer  = 60
                 next_player       = 2 if current_player == 1 else 1
+
+    # ── Watch fallen tile leave screen before declaring game over ─────────────
+    if watching_fall:
+        if fallen_tile_off_screen(current_player):
+            watching_fall = False
+            game_over     = True
+            winner        = 3 - current_player
+            if sound_enabled and "game_over" in sounds:
+                sounds["game_over"].play()
 
     # ── Player transition ─────────────────────────────────────────────────────
     if transition_active:
@@ -712,56 +842,165 @@ while running:
     active_p = next_player if transition_active else current_player
     draw_background(winner if game_over else active_p)
 
-    # Bar
-    bar_rect = pygame.Rect(
-        SCREEN_WIDTH // 2 - BAR_WIDTH // 2, BAR_Y, BAR_WIDTH, BAR_VISUAL_HEIGHT
-    )
-    pygame.draw.rect(screen, BAR_COLOR, bar_rect, border_radius=5)
-    pygame.draw.rect(screen, (0, 0, 0), bar_rect, 2, border_radius=5)
+    # Bar — shadow first, then body, then highlight line on top edge
+    bar_top_world  = bar_body.position.y + BAR_PHYSICS_HEIGHT / 2
+    bar_top_screen = int(SCREEN_HEIGHT - bar_top_world + camera_y)
+    bx = SCREEN_WIDTH // 2 - current_bar_width // 2
+
+    # Drop shadow (3 px below, semi-transparent)
+    shadow_surf = pygame.Surface((current_bar_width + 6, BAR_VISUAL_HEIGHT + 4), pygame.SRCALPHA)
+    shadow_surf.fill((0, 0, 0, 60))
+    screen.blit(shadow_surf, (bx - 3, bar_top_screen + 3))
+
+    bar_rect = pygame.Rect(bx, bar_top_screen, current_bar_width, BAR_VISUAL_HEIGHT)
+    pygame.draw.rect(screen, BAR_COLOR,   bar_rect, border_radius=4)
+    pygame.draw.rect(screen, BAR_SHADOW,  bar_rect, 2, border_radius=4)
+    # Highlight line — 1px bright strip at very top
+    pygame.draw.line(screen, (180, 130, 70),
+                     (bx + 6, bar_top_screen + 1),
+                     (bx + current_bar_width - 6, bar_top_screen + 1), 1)
+
+    # ── HUD panel (top-left) ─────────────────────────────────────────────────
+    hud_panel = pygame.Surface((210, 92), pygame.SRCALPHA)
+    pygame.draw.rect(hud_panel, (20, 20, 40, 160), (0, 0, 210, 92), border_radius=14)
+    pygame.draw.rect(hud_panel, (255, 255, 255, 30), (0, 0, 210, 92), 1, border_radius=14)
+    screen.blit(hud_panel, (10, 10))
+
+    p_col  = P1_MAIN if active_p == 1 else P2_MAIN
+    p_name = "Player 1" if active_p == 1 else "Player 2"
+    hud_f1 = pygame.font.Font(None, 30)
+    hud_f2 = pygame.font.Font(None, 24)
+
+    # Player indicator dot + name
+    pygame.draw.circle(screen, p_col, (30, 28), 8)
+    screen.blit(hud_f1.render(p_name, True, (230, 235, 255)), (46, 20))
+
+    # Level, tiles, countdown
+    next_lvl = LEVEL_TILES - (tiles_placed % LEVEL_TILES)
+    lines = [
+        f"Level  {current_level}",
+        f"Tiles  {tiles_placed}    Next lvl in {next_lvl}",
+    ]
+    for i, line in enumerate(lines):
+        screen.blit(hud_f2.render(line, True, (190, 200, 230)), (18, 46 + i * 22))
 
     draw_objects()
     if DEBUG:
         draw_physics_outlines()
 
-    # Buttons
+    # ── Drop guide — faint vertical dashed line under preview ────────────────
+    if preview_active and not settling and not transition_active and not game_over:
+        guide_surf = pygame.Surface((2, SCREEN_HEIGHT), pygame.SRCALPHA)
+        for gy in range(0, SCREEN_HEIGHT, 14):
+            pygame.draw.line(guide_surf, (120, 130, 160, 55), (0, gy), (0, gy + 7))
+        screen.blit(guide_surf, (preview_x, 0))
+
+    # ── Bottom toolbar background ─────────────────────────────────────────────
+    toolbar_h = 70
+    toolbar = pygame.Surface((SCREEN_WIDTH, toolbar_h), pygame.SRCALPHA)
+    pygame.draw.rect(toolbar, (15, 15, 35, 200), (0, 0, SCREEN_WIDTH, toolbar_h))
+    pygame.draw.line(toolbar, (255, 255, 255, 30), (0, 0), (SCREEN_WIDTH, 0), 1)
+    screen.blit(toolbar, (0, SCREEN_HEIGHT - toolbar_h))
+
+    # ── Buttons ───────────────────────────────────────────────────────────────
     for name, rect in buttons.items():
-        p1c, p2c = P1_MAIN, P2_MAIN
         main_c  = P1_MAIN  if active_p == 1 else P2_MAIN
         light_c = P1_LIGHT if active_p == 1 else P2_LIGHT
         dark_c  = P1_DARK  if active_p == 1 else P2_DARK
+        disabled = settling or transition_active or game_over
 
-        fill   = light_c if (hover_button == name and not game_over and not settling and not transition_active) else main_c
-        draw_rounded_rect(screen, fill, rect, 12, border=2, border_color=dark_c)
-        label  = btn_font.render(button_labels[name], True, (255, 255, 255))
+        if disabled:
+            fill = (80, 82, 95)
+            border = (60, 62, 75)
+        elif hover_button == name:
+            fill = light_c
+            border = dark_c
+        else:
+            fill = main_c
+            border = dark_c
+
+        draw_rounded_rect(screen, fill, rect, 12, border=2, border_color=border)
+        label = btn_font.render(button_labels[name], True,
+                                (200, 205, 215) if disabled else (255, 255, 255))
         screen.blit(label, label.get_rect(center=rect.center))
 
-    # Preview
+    # ── Preview tile ──────────────────────────────────────────────────────────
     if preview_active and not settling and not transition_active and not game_over:
         draw_preview(screen, preview_data, preview_x, preview_y, preview_angle, current_player)
 
-    # Transition overlay
+    # ── Transition overlay ────────────────────────────────────────────────────
     if transition_active:
+        # Full-screen dimmer
         ov = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        ov.fill((0, 0, 0, 100))
+        ov.fill((0, 0, 0, 110))
         screen.blit(ov, (0, 0))
-        f72 = pygame.font.Font(None, 72)
-        f48 = pygame.font.Font(None, 48)
-        t = f72.render(f"{'Red' if next_player==1 else 'Blue'}'s Turn", True, (255, 255, 255))
-        screen.blit(t, t.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 30)))
-        s = f48.render("Get Ready...", True, (220, 220, 220))
-        screen.blit(s, s.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 20)))
 
-    # Game-over overlay
+        p_color = P1_MAIN if next_player == 1 else P2_MAIN
+        p_name  = "Player 1" if next_player == 1 else "Player 2"
+
+        # Pill card
+        card_w, card_h = 420, 130
+        card_x = (SCREEN_WIDTH - card_w) // 2
+        card_y = SCREEN_HEIGHT // 2 - card_h // 2
+        card   = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
+        pygame.draw.rect(card, (*p_color, 220), (0, 0, card_w, card_h), border_radius=22)
+        pygame.draw.rect(card, (255, 255, 255, 60), (0, 0, card_w, card_h), 2, border_radius=22)
+        screen.blit(card, (card_x, card_y))
+
+        f_big = pygame.font.Font(None, 62)
+        f_sub = pygame.font.Font(None, 36)
+        t1 = f_big.render(f"{p_name}'s Turn", True, (255, 255, 255))
+        t2 = f_sub.render("Get Ready…", True, (255, 255, 255, 180))
+        screen.blit(t1, t1.get_rect(center=(SCREEN_WIDTH // 2, card_y + 44)))
+        screen.blit(t2, t2.get_rect(center=(SCREEN_WIDTH // 2, card_y + 95)))
+
+    # ── Level-up flash banner ─────────────────────────────────────────────────
+    if level_flash_timer > 0:
+        level_flash_timer -= 1
+        alpha = min(255, level_flash_timer * 5)
+        lv_w, lv_h = 500, 110
+        lv_surf = pygame.Surface((lv_w, lv_h), pygame.SRCALPHA)
+        pygame.draw.rect(lv_surf, (20, 20, 20, int(alpha * 0.7)),
+                         (0, 0, lv_w, lv_h), border_radius=18)
+        pygame.draw.rect(lv_surf, (255, 215, 0, alpha),
+                         (0, 0, lv_w, lv_h), 2, border_radius=18)
+        fnt_big = pygame.font.Font(None, 78)
+        fnt_sub = pygame.font.Font(None, 36)
+        t1 = fnt_big.render(f"✦  LEVEL {current_level}  ✦", True, (255, 215, 0))
+        t2 = fnt_sub.render(f"Bar width +20% → {current_bar_width}px", True, (200, 230, 255))
+        t1.set_alpha(alpha); t2.set_alpha(alpha)
+        lv_surf.blit(t1, t1.get_rect(centerx=lv_w//2, top=10))
+        lv_surf.blit(t2, t2.get_rect(centerx=lv_w//2, top=72))
+        screen.blit(lv_surf, ((SCREEN_WIDTH - lv_w) // 2, SCREEN_HEIGHT // 2 - 55))
+
+    # ── Game-over overlay ─────────────────────────────────────────────────────
     if game_over:
         ov = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        ov.fill((0, 0, 0, 150))
+        ov.fill((0, 0, 0, 160))
         screen.blit(ov, (0, 0))
-        f72 = pygame.font.Font(None, 72)
-        f48 = pygame.font.Font(None, 48)
-        t = f72.render(f"{'Red' if winner==1 else 'Blue'} Wins!", True, (255, 255, 255))
-        screen.blit(t, t.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 30)))
-        s = f48.render("Press ENTER to restart", True, (220, 220, 220))
-        screen.blit(s, s.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 20)))
+
+        w_color = P1_MAIN if winner == 1 else P2_MAIN
+        w_name  = "Player 1" if winner == 1 else "Player 2"
+
+        card_w, card_h = 460, 160
+        card_x = (SCREEN_WIDTH - card_w) // 2
+        card_y = SCREEN_HEIGHT // 2 - card_h // 2
+        card   = pygame.Surface((card_w, card_h), pygame.SRCALPHA)
+        pygame.draw.rect(card, (*w_color, 230), (0, 0, card_w, card_h), border_radius=24)
+        pygame.draw.rect(card, (255, 255, 255, 80), (0, 0, card_w, card_h), 2, border_radius=24)
+        # Gold shimmer line
+        pygame.draw.line(card, (255, 215, 0, 180), (30, 8), (card_w - 30, 8), 2)
+        screen.blit(card, (card_x, card_y))
+
+        f_big = pygame.font.Font(None, 76)
+        f_sub = pygame.font.Font(None, 38)
+        f_tip = pygame.font.Font(None, 30)
+        t1 = f_big.render(f"🏆  {w_name} Wins!", True, (255, 255, 255))
+        t2 = f_sub.render(f"Tiles stacked: {tiles_placed}", True, (255, 255, 255, 210))
+        t3 = f_tip.render("Press ENTER to play again", True, (220, 230, 255, 180))
+        screen.blit(t1, t1.get_rect(center=(SCREEN_WIDTH // 2, card_y + 50)))
+        screen.blit(t2, t2.get_rect(center=(SCREEN_WIDTH // 2, card_y + 100)))
+        screen.blit(t3, t3.get_rect(center=(SCREEN_WIDTH // 2, card_y + 135)))
 
     pygame.display.flip()
     clock.tick(FPS)
